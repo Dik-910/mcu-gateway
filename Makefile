@@ -18,9 +18,13 @@ LDLIBS  += -lpthread -Wl,--no-as-needed -lgcc_s
 # 这样仓库在任何机器上都能构建 —— MQTT 实现没联调过，
 # 不应该因为它挡住整条 CI。
 HAVE_MQTT := $(shell test -f /usr/include/MQTTClient.h && echo 1)
+# 注意：用 CPPFLAGS 而不是 CFLAGS。
+# 命令行传 CFLAGS="..." 时（比如 CI 里的 -Werror 检查）会覆盖 Makefile 的 +=，
+# 若把 -DMG_HAVE_MQTT 放在 CFLAGS 里就会悄悄丢掉，编出没有 MQTT 的二进制，
+# 而 interop 测试仍然"跑得很正常"——只是它测的是 stub。
 ifeq ($(HAVE_MQTT),1)
-CFLAGS  += -DMG_HAVE_MQTT
-LDLIBS  += -lpaho-mqtt3c
+CPPFLAGS += -DMG_HAVE_MQTT
+LDLIBS   += -lpaho-mqtt3c
 endif
 
 KERNEL := thirdparty/freertos/tasks.c \
@@ -46,10 +50,13 @@ ALL_SRC := $(CORE) $(KERNEL)
 
 .PHONY: all test clean
 
-all: gw-demo
+all: gw-demo gw-mqtt
 
 gw-demo: examples/gw_demo.c $(ALL_SRC)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDLIBS)
+
+gw-mqtt: examples/gw_mqtt.c $(ALL_SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 # ---- 单元测试 ----
 #
@@ -57,21 +64,39 @@ gw-demo: examples/gw_demo.c $(ALL_SRC)
 # 所以单独编，跑得快、依赖少。涉及任务的才连内核。
 
 test/mg_session_test: test/mg_session_test.c src/protocol/mg_session.c
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 test/mg_modbus_test: test/mg_modbus_test.c src/protocol/mg_modbus.c
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 test/mg_channel_test: test/mg_channel_test.c src/channel/mg_channel.c src/channel/mg_chan_loopback.c thirdparty/log/log.c
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 test/mg_flow_test: test/mg_flow_test.c $(ALL_SRC)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 TESTS := test/mg_session_test test/mg_modbus_test test/mg_channel_test test/mg_flow_test
+
+# MQTT 联调：需要 broker 已在 1883 监听（make broker 可以起一个）。
+# Paho 未安装时明确跳过，而不是假装通过。
+.PHONY: interop broker
+interop: gw-mqtt
+	@if [ -z "$(HAVE_MQTT)" ]; then \
+	  echo "SKIP: Paho C not found (install libpaho-mqtt-dev)"; exit 0; fi
+	@echo "--- starting gw-mqtt (18s) ---"
+	@./gw-mqtt --seconds 18 > .gw-mqtt.log 2>&1 & \
+	 GW=$$!; sleep 2; \
+	 python3 tools/mqtt_interop.py; RC=$$?; \
+	 kill $$GW 2>/dev/null; wait $$GW 2>/dev/null; \
+	 echo "--- gw-mqtt log ---"; tail -8 .gw-mqtt.log; \
+	 exit $$RC
+
+# 本地没有 mosquitto 时用独立实现的 broker（需要 pip install amqtt）
+broker:
+	@python3 tools/run_broker.py
 
 test: $(TESTS)
 	@for t in $(TESTS); do echo "=== $$t ==="; ./$$t || exit 1; done
 
 clean:
-	$(RM) gw-demo $(TESTS)
+	$(RM) gw-demo gw-mqtt $(TESTS)

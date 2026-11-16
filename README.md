@@ -159,9 +159,13 @@ typedef struct {
 ## 构建与验证
 
 ```bash
-make            # 编译演示程序 gw-demo
+make            # 编译 gw-demo（无硬件演示）与 gw-mqtt（MQTT 联调）
 make test       # 运行全部单元测试
-./gw-demo       # 无硬件演示：回环通道 + 模拟从机，跑 8 秒
+./gw-demo       # 回环通道 + 模拟从机，不需要任何外部依赖
+
+# MQTT 联调需要 broker 在 1883 监听
+make broker     # 没有 mosquitto 时用仓库自带的 amqtt 版 broker（需 pip install amqtt）
+make interop    # 起网关 + 跑上下行闭环验证
 ```
 
 `make test` 共 114 项断言：
@@ -172,6 +176,8 @@ make test       # 运行全部单元测试
 | `mg_modbus_test` | 27 项：CRC 已知值、组帧字节精确、异常响应、CRC 错误拒绝 |
 | `mg_channel_test` | 29 项：双向隔离、参数校验、队列定深、dlc 越界拦截 |
 | `mg_flow_test` | 13 项：**真实 FreeRTOS 上跑端到端**，含从机掉线与恢复 |
+
+另外 `make interop` 有 20 项 MQTT 联调断言（需要 broker），见下节。
 
 CRC 的期望值不是用被测函数生成的，而是先用 Python 独立实现算出来，
 再用 Modbus 文档里的已知样例（`01 04 00 00 00 01` → `31 CA`）交叉核对。
@@ -189,6 +195,59 @@ stats: rx_drop=0 parse_err=0 json_err=0 up_err=0
 ```
 
 栈水位是给目标板调栈大小的依据。不测这个，栈溢出只会表现为随机死机。
+
+## MQTT 联调
+
+联调最容易做假的地方是**只测一个方向**：能看到上行有数据就宣布成功。
+但一个只会发不会收的客户端也能通过这种测试。
+
+所以联调脚本验证的是闭环：
+
+```
+PASS  uplink carries modbus samples  (23 msgs)
+PASS  baseline value is 200 (reg*100)
+PASS  published gw/downlink: {'slave': 1, 'reg': 2, 'value': 777}
+PASS  gateway acknowledged the write  (1 ack)
+PASS  ack carries new value 777
+PASS  gateway polled the written register again
+PASS  readback reflects the write (777)  (values seen: [777])
+PASS  gateway keeps polling after bad commands
+Result: 20 passed, 0 failed
+```
+
+最后那条 `readback reflects the write` 是关键：
+云端下发的值必须真的经过「解析 JSON → 构造 Modbus 写请求 → 从机改寄存器 →
+下一轮轮询读回」这条链路，才会出现在上行里。任何一环断掉，那条断言就红。
+
+### 三处实现细节
+
+**1. 回调不能直接调 FreeRTOS API**
+
+Paho 的消息回调跑在它自己的线程里（PC）或需要主动 yield（MCU），
+都不是 RTOS 任务上下文。在里面调 `xQueueSend` 在 POSIX 移植上也许能跑，
+到 Cortex-M 上直接崩。
+
+所以下行数据走单生产者/单消费者环形缓冲：回调只写 `head`，`cmd_task` 只写 `tail`，
+不需要锁。
+
+**2. 重连不能放在 publish 里**
+
+`MQTTClient_connect` 可能阻塞数秒。顺手在 publish 里重连，会把调用它的解析任务
+一起卡住，采集直接停摆。所以有独立的 `comm_task` 负责 tick 重连，
+退避 1s → 2s → 4s → … → 30s 封顶。
+
+**3. 写响应要单独解析**
+
+Modbus 写响应（`0x06`）没有「字节数」字段，直接回显请求的地址和值。
+塞进读响应的解析路径会解出错的值 —— 取到的是 `reg` 和 `value` 的高字节拼起来。
+
+### 关于 broker
+
+CI 用 **mosquitto**（`apt install mosquitto`），本地没有 mosquitto 时
+用 `tools/run_broker.py`（基于 amqtt，独立的 Python 实现）。
+
+**刻意不自己写 broker**：自己写一个再测自己的客户端，就是自己跟自己对测，
+格式错了两边一起错。用第三方实现才有意义 —— 这和用 udsoncan 测 UDS 是同一个道理。
 
 ## 目录
 
@@ -208,8 +267,8 @@ test/                      单元测试
 
 诚实列出，避免误判成熟度：
 
-- **MQTT 未联调**：实现已就位，能编译，但本机没有 broker，从未真正收发过。
-  CI 只验证构建。
+- **MQTT 只在 QoS0 上验证过**：QoS1 的重传、去重、持久会话都没测。
+- **断线期间的数据直接丢**：没有落盘缓存和恢复后补发。
 - **STM32 平台未实现**：`mg_chan_bxcan.c` 和 Cortex-M port 都还没写，需要硬件。
 - **LoRa / NB-IoT 未接入**：通道抽象留了位置，没有实现。
 - **Modbus 从机模式未做**：只有主站（网关主动轮询）。

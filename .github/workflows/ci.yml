@@ -15,7 +15,18 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential
+          sudo apt-get install -y -qq build-essential python3-pip
+          # MQTT 联调需要 C 客户端库 + 一个真实 broker。
+          # 用 mosquitto 而不是仓库自带的 amqtt 脚本 —— 它是这个协议最权威的实现，
+          # 拿它来测我们的客户端才有意义。
+          sudo apt-get install -y -qq libpaho-mqtt-dev mosquitto mosquitto-clients
+          python3 -m pip install --quiet paho-mqtt
+
+      - name: Show toolchain
+        run: |
+          gcc --version | head -1
+          test -f /usr/include/MQTTClient.h && echo "paho-c: present" || echo "paho-c: MISSING"
+          mosquitto -h 2>&1 | head -1 || true
 
       - name: Build
         run: make
@@ -42,3 +53,27 @@ jobs:
           grep -q "sess start=" /tmp/demo.log
           grep -qE "timeout=0" /tmp/demo.log
           echo "demo produced json and stats"
+
+      - name: Start mosquitto
+        run: |
+          # 有的 runner 镜像自带 mosquitto 服务并已占用 1883，
+          # 先探测再启动，避免 -d 静默失败。
+          if ! python3 -c "import socket;socket.create_connection(('127.0.0.1',1883),1)" 2>/dev/null; then
+            mosquitto -p 1883 -d
+            sleep 2
+          fi
+          python3 -c "
+          import socket
+          s = socket.create_connection(('127.0.0.1', 1883), timeout=3)
+          s.close()
+          print('broker reachable')
+          "
+
+      - name: MQTT interop (uplink + downlink closed loop)
+        run: |
+          make interop | tee /tmp/interop.log
+          # 必须真的跑了。Paho 缺失时 make interop 会 SKIP 并返回 0，
+          # 那是静默跳过 —— 这两行防止「CI 绿了但其实没测」。
+          grep -qE "Result: [0-9]+ passed, 0 failed" /tmp/interop.log
+          grep -q "readback reflects the write" /tmp/interop.log
+          echo "downlink write verified by readback"

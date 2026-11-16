@@ -65,6 +65,18 @@ static void report(mg_gw_t *gw, const mg_frame_t *f, uint16_t sid,
     cJSON_AddNumberToObject(o, "sid", sid);      /* 0 表示没匹配上会话 */
     cJSON_AddNumberToObject(o, "ts", f->ts_ms);
 
+    /*
+     * 寄存器地址必须从会话里取：Modbus 的读响应只带数据，不带地址。
+     * 没有这个字段，上报出去的数据就是「某个 slave 的某个值是 200」，
+     * 上游无法知道是哪个点 —— 也就没法验证下行写入是否生效。
+     */
+    if (sid != 0)
+    {
+        mg_session_t *sess = mg_sess_get(&gw->sess, sid);
+        if (sess != 0)
+            cJSON_AddNumberToObject(o, "reg", sess->reg);
+    }
+
     if (exc != 0)
     {
         /* 异常响应：带上异常码，不要伪装成数值 */
@@ -89,6 +101,51 @@ static void report(mg_gw_t *gw, const mg_frame_t *f, uint16_t sid,
                 gw->uplink_errors++;
         }
         cJSON_free(s);
+    }
+
+    cJSON_Delete(o);
+}
+
+/*
+ * 写响应（功能码 0x06）单独处理。
+ *
+ * 它的格式和读响应不同：没有「字节数」字段，直接回显请求的
+ * 寄存器地址和值。放进通用解析会把它当成读响应，
+ * 解出来的 value 是错的（会取到 reg 和 value 的高字节拼起来）。
+ */
+static void report_write_ack(mg_gw_t *gw, const mg_frame_t *f)
+{
+    cJSON *o = cJSON_CreateObject();
+    char *str;
+
+    if (o == 0)
+    {
+        gw->json_errors++;
+        return;
+    }
+
+    cJSON_AddStringToObject(o, "gw", "mcu-gateway");
+    cJSON_AddStringToObject(o, "ch", gw->ch[f->channel].name);
+    cJSON_AddStringToObject(o, "type", "write_ack");
+    cJSON_AddNumberToObject(o, "slave", f->data[0]);
+    cJSON_AddNumberToObject(o, "reg", (f->data[2] << 8) | f->data[3]);
+    cJSON_AddNumberToObject(o, "value", (f->data[4] << 8) | f->data[5]);
+    cJSON_AddNumberToObject(o, "ts", f->ts_ms);
+
+    str = cJSON_PrintUnformatted(o);
+
+    if (str == 0)
+    {
+        gw->json_errors++;
+    }
+    else
+    {
+        if (gw->uplink != 0 && gw->uplink->publish != 0)
+        {
+            if (gw->uplink->publish(str) != 0)
+                gw->uplink_errors++;
+        }
+        cJSON_free(str);
     }
 
     cJSON_Delete(o);
@@ -151,6 +208,30 @@ static void handle_frame(mg_gw_t *gw, const mg_frame_t *f)
     if (f->dlc < 5)
     {
         gw->parse_errors++;
+        return;
+    }
+
+    /* 写响应走单独分支：格式与读响应不同 */
+    if ((f->data[1] & 0x7F) == MB_FUNC_WRITE_REGISTER)
+    {
+        uint16_t crc_calc, crc_recv;
+
+        if (f->dlc < 7)
+        {
+            gw->parse_errors++;
+            return;
+        }
+
+        crc_calc = mg_mb_crc16(f->data, (uint16_t)(f->dlc - 2));
+        crc_recv = (uint16_t)(f->data[f->dlc - 2] | (f->data[f->dlc - 1] << 8));
+
+        if (crc_calc != crc_recv)
+        {
+            gw->parse_errors++;
+            return;
+        }
+
+        report_write_ack(gw, f);
         return;
     }
 
@@ -315,6 +396,106 @@ static void poll_task(void *p)
     vTaskDelete(NULL);
 }
 
+/*
+ * 处理一条下行指令。
+ *
+ * 指令格式（云端约定）：
+ *   {"slave":1,"reg":2,"value":100}
+ *
+ * 只支持写单寄存器。写线圈要再定一个字段，这里不做 ——
+ * 一个字段表达两种写操作，靠猜是不行的。
+ */
+static void handle_cmd(mg_gw_t *gw, const char *json)
+{
+    cJSON *o = cJSON_Parse(json);
+    cJSON *sl, *rg, *vl;
+
+    if (o == 0)
+    {
+        gw->cmd_errors++;
+        log_warn("cmd: json parse failed");
+        return;
+    }
+
+    sl = cJSON_GetObjectItem(o, "slave");
+    rg = cJSON_GetObjectItem(o, "reg");
+    vl = cJSON_GetObjectItem(o, "value");
+
+    if (!cJSON_IsNumber(sl) || !cJSON_IsNumber(rg) || !cJSON_IsNumber(vl))
+    {
+        gw->cmd_errors++;
+        log_warn("cmd: missing slave/reg/value");
+        cJSON_Delete(o);
+        return;
+    }
+
+    for (uint8_t i = 0; i < gw->ch_count; i++)
+    {
+        mg_frame_t f;
+
+        if (gw->ch[i].kind != MG_KIND_MODBUS)
+            continue;
+
+        memset(&f, 0, sizeof(f));
+        f.channel = i;
+        f.id = (uint32_t)sl->valueint;
+        f.dlc = MG_FRAME_DATA;
+        f.ts_ms = now_ms();
+
+        if (mg_mb_build_write_reg((uint8_t)sl->valueint, (uint16_t)rg->valueint,
+                                  (uint16_t)vl->valueint, f.data) != MG_OK)
+        {
+            gw->cmd_errors++;
+            break;
+        }
+
+        if (mg_channel_send(&gw->ch[i], &f) == MG_OK)
+        {
+            gw->cmd_applied++;
+            log_info("cmd: write slave %d reg %d = %d",
+                     sl->valueint, rg->valueint, vl->valueint);
+        }
+        else
+        {
+            gw->uplink_errors++;
+        }
+        break;
+    }
+
+    cJSON_Delete(o);
+}
+
+/*
+ * 通信任务：驱动重连 + 消费下行。
+ *
+ * 为什么不把 tick 放进 publish：connect 可能阻塞 3 秒，
+ * 那会把调用 publish 的解析任务一起卡住，采集直接停摆。
+ */
+static void comm_task(void *p)
+{
+    mg_gw_t *gw = (mg_gw_t *)p;
+    char buf[MG_DOWNLINK_MAX];
+
+    log_info("comm_task started");
+
+    while (gw->running)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        if (gw->uplink != 0 && gw->uplink->tick != 0)
+            gw->uplink->tick();
+
+        if (mg_uplink_poll_cmd(buf, sizeof(buf)) > 0)
+        {
+            gw->cmd_received++;
+            handle_cmd(gw, buf);
+        }
+    }
+
+    log_info("comm_task exit");
+    vTaskDelete(NULL);
+}
+
 static void monitor_task(void *p)
 {
     mg_gw_t *gw = (mg_gw_t *)p;
@@ -417,6 +598,9 @@ int mg_gw_start(mg_gw_t *gw)
     if (xTaskCreate(monitor_task, "mon", 1024, gw, 1, &gw->monitor_task) != pdPASS)
         return MG_ERR_STATE;
 
+    if (xTaskCreate(comm_task, "comm", 1536, gw, 1, &gw->comm_task) != pdPASS)
+        return MG_ERR_STATE;
+
     return MG_OK;
 }
 
@@ -437,11 +621,14 @@ void mg_gw_print_stats(mg_gw_t *gw)
         return;
 
     log_info("stats: rx_drop=%u parse_err=%u json_err=%u up_err=%u "
-             "sess start=%u done=%u timeout=%u unmatched=%u",
+             "sess start=%u done=%u timeout=%u unmatched=%u "
+             "cmd rx=%u ok=%u err=%u",
              (unsigned)gw->rx_dropped, (unsigned)gw->parse_errors,
              (unsigned)gw->json_errors, (unsigned)gw->uplink_errors,
              (unsigned)gw->sess.started, (unsigned)gw->sess.completed,
-             (unsigned)gw->sess.timedout, (unsigned)gw->sess.unmatched);
+             (unsigned)gw->sess.timedout, (unsigned)gw->sess.unmatched,
+             (unsigned)gw->cmd_received, (unsigned)gw->cmd_applied,
+             (unsigned)gw->cmd_errors);
 
     for (uint8_t i = 0; i < gw->ch_count; i++)
     {

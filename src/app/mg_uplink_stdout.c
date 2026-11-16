@@ -3,6 +3,9 @@
  *
  * 演示和测试用。真正的价值是：让整条链路（收帧 -> 会话匹配 -> JSON）
  * 在没有 broker、没有硬件的情况下就能验证。
+ *
+ * 它没有下行能力，mg_uplink_poll_cmd 永远返回 0 ——
+ * 这对演示没影响，因为演示里没有云端下发。
  */
 #include "mg_uplink.h"
 #include <stdio.h>
@@ -26,6 +29,10 @@ static int up_publish(const char *json)
     return 0;
 }
 
+static void up_tick(void)
+{
+}
+
 static void up_close(void)
 {
     printf("[uplink:stdout] closed, total %u\n", (unsigned)g_count);
@@ -33,7 +40,7 @@ static void up_close(void)
 
 static const mg_uplink_ops_t g_stdout_ops =
 {
-    up_open, up_publish, up_close
+    up_open, up_publish, up_tick, up_close
 };
 
 const mg_uplink_ops_t *mg_uplink_stdout_ops(void)

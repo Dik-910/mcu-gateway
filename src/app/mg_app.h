@@ -10,6 +10,10 @@
  *   poll_task        周期下发 Modbus 读请求、收割超时会话。
  *                    与解析分离，因为「发」和「收」的节奏不同。
  *   monitor_task     周期打印统计与各任务栈水位。
+ *   comm_task        驱动 uplink 的重连，并消费下行指令。
+ *
+ * comm_task 必须独立：重连时 connect 可能阻塞数秒，
+ * 放在 parse_task 或 publish 里会把整条采集链路一起卡住。
  *
  * 为什么不学课程项目那样「一个通道一个完整处理任务」：
  * 那样每个通道都要各写一份解析 + 上报逻辑，加第三路通道时复制粘贴，
@@ -45,6 +49,7 @@ typedef struct
     TaskHandle_t parse_task;
     TaskHandle_t poll_task;
     TaskHandle_t monitor_task;
+    TaskHandle_t comm_task;    /* 重连 + 下行指令 */
 
     volatile int running;
 
@@ -53,6 +58,11 @@ typedef struct
     uint32_t parse_errors;   /* CRC 错、长度错 */
     uint32_t json_errors;
     uint32_t uplink_errors;
+
+    /* 下行 */
+    uint32_t cmd_received;   /* 从 uplink 取到的指令条数 */
+    uint32_t cmd_applied;    /* 成功转成总线请求 */
+    uint32_t cmd_errors;     /* JSON 解析失败或缺字段 */
 } mg_gw_t;
 
 int  mg_gw_init(mg_gw_t *gw, const mg_uplink_ops_t *up);
