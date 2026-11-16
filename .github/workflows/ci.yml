@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential
+
+      - name: Build
+        run: make
+
+      - name: Unit tests
+        run: make test
+
+      - name: Strict rebuild (-Werror)
+        run: |
+          make clean
+          make CFLAGS="-std=gnu99 -Wall -Wextra -Werror -O1 -I. \
+            -Isrc/util -Isrc/channel -Isrc/protocol -Isrc/app \
+            -Ithirdparty/freertos/include -Ithirdparty/freertos/port \
+            -Ithirdparty/freertos -Ithirdparty/cJSON -Ithirdparty/log"
+
+      - name: Smoke run (loopback, no hardware)
+        run: |
+          timeout 30 ./gw-demo --seconds 4 | tee /tmp/demo.log
+          grep -q "mcu-gateway" /tmp/demo.log
+          grep -q '"sid"' /tmp/demo.log
+          grep -q "sess start=" /tmp/demo.log
+          grep -qE "timeout=0" /tmp/demo.log
+          echo "demo produced json and stats"

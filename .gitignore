@@ -1,0 +1,7 @@
+# 构建产物
+*.o
+gw-demo
+test/mg_session_test
+test/mg_modbus_test
+test/mg_channel_test
+test/mg_flow_test
