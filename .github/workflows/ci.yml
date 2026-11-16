@@ -33,7 +33,10 @@ jobs:
 
       - name: Smoke run (loopback, no hardware)
         run: |
-          timeout 30 ./gw-demo --seconds 4 | tee /tmp/demo.log
+          # 日志走 stderr、数据走 stdout，两个流都要收 —— 只重定向 stdout
+          # 会漏掉 stats 行，断言就会假失败。
+          timeout 30 ./gw-demo --seconds 4 > /tmp/demo.log 2>&1
+          cat /tmp/demo.log
           grep -q "mcu-gateway" /tmp/demo.log
           grep -q '"sid"' /tmp/demo.log
           grep -q "sess start=" /tmp/demo.log
