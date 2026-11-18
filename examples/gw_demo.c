@@ -20,6 +20,7 @@
 #include "task.h"
 #include "mg_app.h"
 #include "mg_modbus.h"
+#include "mg_param_file.h"
 #include "log.h"
 
 static int g_seconds = 8;
@@ -96,7 +97,6 @@ static void shutdown_task(void *p)
 int main(int argc, char **argv)
 {
     static mg_gw_t gw;
-    uint8_t idx;
 
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
@@ -112,11 +112,30 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* 通道名用 modbus0，arg 对回环实现无意义 */
-    if (mg_gw_add_channel(&gw, "modbus0", MG_KIND_MODBUS, "loop", &idx) != MG_OK)
+    /*
+     * 通道表与轮询表来自参数区，不再写死在代码里。
+     * 首次启动没有有效参数时写入默认值；之后改参数不必重新编译。
+     */
     {
-        printf("add channel failed\n");
-        return 1;
+        mg_param_t prm;
+        const char *ppath = getenv("MG_PARAM_FILE");
+        int page = -1;
+
+        if (mg_param_load_file(ppath ? ppath : "gw_param.bin", &prm, &page) != MG_OK)
+        {
+            printf("param load failed\n");
+            return 1;
+        }
+
+        if (mg_gw_apply_param(&gw, &prm) != MG_OK)
+        {
+            printf("apply param failed\n");
+            return 1;
+        }
+
+        log_info("param: %d channel(s), %d poll entries, interval %d ms, source=%s",
+                 prm.ch_count, prm.poll_count, prm.poll_interval_ms,
+                 page < 0 ? "defaults" : (page == 0 ? "page0" : "page1"));
     }
 
     if (mg_gw_start(&gw) != MG_OK)

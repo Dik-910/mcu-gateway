@@ -29,6 +29,8 @@
 
 #include <stdint.h>
 
+#include "mg_storage.h"
+
 #define MG_OUTBOX_PAYLOAD_MAX 200  /* 单条 JSON 上限，超过直接拒绝 */
 #define MG_OUTBOX_SLOT_HDR    16   /* 状态1 + 长度1 + 保留2 + 序号4 + CRC2 + 保留6 */
 #define MG_OUTBOX_SLOT_SIZE   (MG_OUTBOX_SLOT_HDR + MG_OUTBOX_PAYLOAD_MAX)
@@ -40,16 +42,10 @@
 #define MG_OUTBOX_STATE_VALID 0xA5u
 
 /*
- * 后端读写。off 是扇区偏移，必须支持任意偏移、按字节读写 ——
- * 目标是让 Flash 驱动能直接对上（页内任意偏移可写，页擦除在这一层之上）。
- * 返回 0 表示成功，负值失败。
+ * 后端读写接口定义在 mg_storage.h，参数区共用同一套。
+ * 这里保留别名，是为了让调用方不必关心它是不是从 outbox 来的。
  */
-typedef struct
-{
-    int (*read)(void *ctx, uint32_t off, void *buf, uint32_t n);
-    int (*write)(void *ctx, uint32_t off, const void *buf, uint32_t n);
-    void *ctx;
-} mg_outbox_io_t;
+typedef mg_storage_io_t mg_outbox_io_t;
 
 typedef struct
 {

@@ -37,7 +37,8 @@ KERNEL := thirdparty/freertos/tasks.c \
           thirdparty/freertos/utils/wait_for_event.c \
           thirdparty/freertos/memmang/heap_4.c
 
-CORE   := src/channel/mg_channel.c \
+CORE   := src/util/mg_crc16.c \
+          src/channel/mg_channel.c \
           src/channel/mg_chan_loopback.c \
           src/channel/mg_chan_socketcan.c \
           src/protocol/mg_modbus.c \
@@ -45,6 +46,8 @@ CORE   := src/channel/mg_channel.c \
           src/app/mg_app.c \
           src/app/mg_outbox.c \
           src/app/mg_outbox_file.c \
+          src/app/mg_param.c \
+          src/app/mg_param_file.c \
           src/app/mg_uplink_stdout.c \
           src/app/mg_uplink_mqtt.c \
           src/app/mg_freertos_hooks.c \
@@ -81,11 +84,17 @@ test/mg_flow_test: test/mg_flow_test.c $(ALL_SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 # outbox 是纯逻辑 + 文件后端，不依赖 FreeRTOS，单独编
-test/mg_outbox_test: test/mg_outbox_test.c src/app/mg_outbox.c src/app/mg_outbox_file.c
+test/mg_outbox_test: test/mg_outbox_test.c src/app/mg_outbox.c src/app/mg_outbox_file.c \
+                     src/util/mg_crc16.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+# 参数区：纯逻辑 + 文件后端
+test/mg_param_test: test/mg_param_test.c src/app/mg_param.c src/app/mg_param_file.c \
+                    src/app/mg_outbox_file.c src/util/mg_crc16.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 TESTS := test/mg_session_test test/mg_modbus_test test/mg_channel_test test/mg_flow_test \
-         test/mg_outbox_test
+         test/mg_outbox_test test/mg_param_test
 
 # MQTT 联调：需要 broker 已在 1883 监听（make broker 可以起一个）。
 # Paho 未安装时明确跳过，而不是假装通过。

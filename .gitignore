@@ -7,8 +7,9 @@ gw-demo
 # 测试二进制用通配：逐条列举时每加一个用例就要记得补一行，必漏
 /test/*_test
 
-# 运行时数据（outbox 落盘文件）
+# 运行时数据（outbox 与参数区落盘文件）
 /gw_outbox.bin
+/gw_param.bin
 
 # 运行时数据（MQTT 联调）
 /.gw-mqtt.outbox

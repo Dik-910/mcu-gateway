@@ -333,63 +333,67 @@ static void parse_task(void *p)
     vTaskDelete(NULL);
 }
 
+/*
+ * 轮询任务：按参数区的表轮转，一次只发一条。
+ *
+ * 为什么不做「每通道一个任务各发各的」：Modbus RTU 靠从机地址区分响应，
+ * 同一从机的并发请求无法配对，响应回来只能靠猜。串行化之后
+ * 「请求在途至多一条」这个前提成立，会话表的 sid 匹配才有意义。
+ */
 static void poll_task(void *p)
 {
     mg_gw_t *gw = (mg_gw_t *)p;
-    uint8_t slave = 1;
-    uint16_t reg = 0;
+    uint8_t idx = 0;
 
-    log_info("poll_task started, interval %d ms", MG_POLL_INTERVAL_MS);
+    log_info("poll_task started, interval %d ms, %d poll entries",
+             gw->param.poll_interval_ms, gw->param.poll_count);
 
     while (gw->running)
     {
-        vTaskDelay(pdMS_TO_TICKS(MG_POLL_INTERVAL_MS));
+        const mg_param_poll_t *pt;
+        uint8_t interval = gw->param.poll_interval_ms;
+        mg_frame_t f;
+        uint16_t sid;
 
-        for (uint8_t i = 0; i < gw->ch_count; i++)
+        vTaskDelay(pdMS_TO_TICKS(interval ? interval : 100));
+
+        if (gw->param.poll_count == 0)
+            continue;
+
+        pt = &gw->param.poll[idx];
+        idx = (uint8_t)((idx + 1) % gw->param.poll_count);
+
+        /* 参数里可能配了 CAN 通道上的项；CAN 是被动接收，主站不该去问 */
+        if (gw->ch[pt->ch].kind != MG_KIND_MODBUS)
+            continue;
+
+        /*
+         * 先占位再发送。
+         * 顺序反了会漏掉「发出去之后立刻回来」的响应 ——
+         * 在回环或高速总线上这是必然发生的，不是理论情况。
+         */
+        sid = mg_sess_begin(&gw->sess, pt->slave, pt->func, pt->reg, now_ms(),
+                            gw->param.session_timeout_ms);
+        if (sid == 0)
         {
-            mg_frame_t f;
-            uint16_t sid;
-
-            /* 只有 Modbus 通道需要主站轮询；CAN 通道是被动接收 */
-            if (gw->ch[i].kind != MG_KIND_MODBUS)
-                continue;
-
-            /*
-             * 先占位再发送。
-             * 顺序反了会漏掉「发出去之后立刻回来」的响应 ——
-             * 在回环或高速总线上这是必然发生的，不是理论情况。
-             */
-            sid = mg_sess_begin(&gw->sess, slave, MB_FUNC_READ_HOLDING, reg,
-                                now_ms(), MG_SESSION_TIMEOUT);
-            if (sid == 0)
-            {
-                /* 表满：说明对端一直不回。不重试，等上一批超时 */
-                continue;
-            }
-
-            memset(&f, 0, sizeof(f));
-            f.channel = i;
-            f.id = slave;
-            f.dlc = MG_FRAME_DATA;
-            f.ts_ms = now_ms();
-
-            if (mg_mb_build_read(slave, MB_FUNC_READ_HOLDING, reg, f.data) != MG_OK)
-            {
-                mg_sess_release(&gw->sess, sid);
-                continue;
-            }
-
-            if (mg_channel_send(&gw->ch[i], &f) != MG_OK)
-                mg_sess_release(&gw->sess, sid);
+            /* 表满：说明对端一直不回。不重试，等上一批超时 */
+            continue;
         }
 
-        /* 轮转：先换寄存器，一轮 4 个点走完再换从机 */
-        if (++reg >= 4)
+        memset(&f, 0, sizeof(f));
+        f.channel = pt->ch;
+        f.id = pt->slave;
+        f.dlc = MG_FRAME_DATA;
+        f.ts_ms = now_ms();
+
+        if (mg_mb_build_read(pt->slave, pt->func, pt->reg, f.data) != MG_OK)
         {
-            reg = 0;
-            if (++slave > 2)
-                slave = 1;
+            mg_sess_release(&gw->sess, sid);
+            continue;
         }
+
+        if (mg_channel_send(&gw->ch[pt->ch], &f) != MG_OK)
+            mg_sess_release(&gw->sess, sid);
     }
 
     log_info("poll_task exit");
@@ -521,6 +525,13 @@ int mg_gw_init(mg_gw_t *gw, const mg_uplink_ops_t *up)
     mg_sess_init(&gw->sess);
 
     /*
+     * 先填默认参数。调用方若拿到参数区的数据，应在 mg_gw_start 之前
+     * 用 mg_gw_apply_param 覆盖 —— 这样「参数区读不出来也能跑」，
+     * 而不是初始化失败、网关直接不启动。
+     */
+    mg_param_defaults(&gw->param);
+
+    /*
      * 队列元素是 24 字节的结构体，深度 32 约 800 字节。
      * 在 20KB RAM 的 F103 上这是要算进预算的，不能随手开 256。
      */
@@ -529,6 +540,27 @@ int mg_gw_init(mg_gw_t *gw, const mg_uplink_ops_t *up)
         return MG_ERR_STATE;
 
     gw->running = 0;
+    return MG_OK;
+}
+
+int mg_gw_apply_param(mg_gw_t *gw, const mg_param_t *p)
+{
+    if (gw == 0 || p == 0)
+        return MG_ERR_PARAM;
+    if (mg_param_validate(p) != 0)
+        return MG_ERR_PARAM;
+    /* 通道在启动前一次性建好；运行期增删通道会让 rx_task 的下标失效 */
+    if (gw->running)
+        return MG_ERR_STATE;
+
+    for (uint8_t i = 0; i < p->ch_count; i++)
+    {
+        if (mg_gw_add_channel(gw, p->ch[i].name, (mg_chan_kind_t)p->ch[i].kind,
+                              p->ch[i].arg, 0) != MG_OK)
+            return MG_ERR_IO;
+    }
+
+    gw->param = *p;
     return MG_OK;
 }
 

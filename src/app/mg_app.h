@@ -29,6 +29,7 @@
 #include "task.h"
 #include "queue.h"
 #include "mg_channel.h"
+#include "mg_param.h"
 #include "mg_session.h"
 #include "mg_uplink.h"
 
@@ -43,6 +44,7 @@ typedef struct
 
     QueueHandle_t rx_q;
     mg_sess_tbl_t sess;
+    mg_param_t param;              /* 来自参数区；mg_gw_init 先填默认值 */
     const mg_uplink_ops_t *uplink;
 
     TaskHandle_t rx_task[MG_CHANNEL_MAX];
@@ -69,6 +71,14 @@ int  mg_gw_init(mg_gw_t *gw, const mg_uplink_ops_t *up);
 
 int  mg_gw_add_channel(mg_gw_t *gw, const char *name, mg_chan_kind_t kind,
                        const char *arg, uint8_t *out_index);
+
+/*
+ * 把一份校验过的参数装进网关：按表建通道，并接管轮询表。
+ *
+ * 必须在 mg_gw_start 之前调用 —— 参数决定轮询节奏，边跑边换会让
+ * 「当前放到第几项」的游标失去意义。
+ */
+int  mg_gw_apply_param(mg_gw_t *gw, const mg_param_t *p);
 
 /* 创建所有任务。调用前调度器尚未启动，或已启动均可 */
 int  mg_gw_start(mg_gw_t *gw);

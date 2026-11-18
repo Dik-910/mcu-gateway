@@ -15,6 +15,8 @@
 
 #include <string.h>
 
+#include "mg_crc16.h"
+
 #define OUTBOX_VERSION 1u
 
 static uint8_t g_slot_buf[MG_OUTBOX_PAYLOAD_MAX];
@@ -35,29 +37,6 @@ static void put_u32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
-/*
- * CRC-16/CCITT-FALSE。
- *
- * 和 Modbus 那个 CRC 不是一回事（多项式与位序都不同），
- * 这里保护的是本机存储，不参与总线报文，所以不复用 mg_modbus 的实现。
- */
-static uint16_t crc16_update(uint16_t crc, uint8_t b)
-{
-    crc ^= (uint16_t)b << 8;
-    for (int i = 0; i < 8; i++)
-        crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
-    return crc;
-}
-
-static uint16_t crc16_buf(const uint8_t *p, uint16_t n)
-{
-    uint16_t crc = 0xFFFFu;
-
-    for (uint16_t i = 0; i < n; i++)
-        crc = crc16_update(crc, p[i]);
-    return crc;
-}
-
 /* 槽头里参与校验的字段（长度、序号）+ 载荷 */
 static uint16_t slot_crc(uint16_t len, uint32_t seq, const uint8_t *payload, uint16_t n)
 {
@@ -67,9 +46,9 @@ static uint16_t slot_crc(uint16_t len, uint32_t seq, const uint8_t *payload, uin
     head[0] = (uint8_t)len;
     put_u32(&head[1], seq);
 
-    crc = crc16_buf(head, sizeof(head));
+    crc = mg_crc16(head, sizeof(head));
     for (uint16_t i = 0; i < n; i++)
-        crc = crc16_update(crc, payload[i]);
+        crc = mg_crc16_update(crc, payload[i]);
     return crc;
 }
 
@@ -138,7 +117,7 @@ static int write_header(mg_outbox_t *ob)
     hdr[4] = OUTBOX_VERSION;
     put_u32(&hdr[8], ob->read_seq);
 
-    crc = crc16_buf(hdr, 12);
+    crc = mg_crc16(hdr, 12);
     hdr[12] = (uint8_t)(crc & 0xFF);
     hdr[13] = (uint8_t)(crc >> 8);
 
@@ -207,7 +186,7 @@ int mg_outbox_init(mg_outbox_t *ob, const mg_outbox_io_t *io, uint16_t slots)
 
     hdr_ok = (hdr[0] == 'M' && hdr[1] == 'G' && hdr[2] == 'O' && hdr[3] == 'B' &&
               hdr[4] == OUTBOX_VERSION &&
-              crc16_buf(hdr, 12) == (uint16_t)(hdr[12] | (hdr[13] << 8)));
+              mg_crc16(hdr, 12) == (uint16_t)(hdr[12] | (hdr[13] << 8)));
 
     for (uint16_t i = 0; i < slots; i++)
     {
