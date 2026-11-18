@@ -6,6 +6,9 @@
 #   make clean
 
 CC      ?= gcc
+# PATH 上的 python3 可能是某个缺标准库的托管运行时，
+# 显式给一个默认值，需要时用 make PYTHON=... 覆盖
+PYTHON  ?= /usr/bin/python3
 CFLAGS  ?= -std=gnu99 -Wall -Wextra -O1 -g
 CFLAGS  += -I. \
            -Isrc/util -Isrc/channel -Isrc/protocol -Isrc/app \
@@ -40,6 +43,8 @@ CORE   := src/channel/mg_channel.c \
           src/protocol/mg_modbus.c \
           src/protocol/mg_session.c \
           src/app/mg_app.c \
+          src/app/mg_outbox.c \
+          src/app/mg_outbox_file.c \
           src/app/mg_uplink_stdout.c \
           src/app/mg_uplink_mqtt.c \
           src/app/mg_freertos_hooks.c \
@@ -75,25 +80,36 @@ test/mg_channel_test: test/mg_channel_test.c src/channel/mg_channel.c src/channe
 test/mg_flow_test: test/mg_flow_test.c $(ALL_SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
-TESTS := test/mg_session_test test/mg_modbus_test test/mg_channel_test test/mg_flow_test
+# outbox 是纯逻辑 + 文件后端，不依赖 FreeRTOS，单独编
+test/mg_outbox_test: test/mg_outbox_test.c src/app/mg_outbox.c src/app/mg_outbox_file.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+TESTS := test/mg_session_test test/mg_modbus_test test/mg_channel_test test/mg_flow_test \
+         test/mg_outbox_test
 
 # MQTT 联调：需要 broker 已在 1883 监听（make broker 可以起一个）。
 # Paho 未安装时明确跳过，而不是假装通过。
-.PHONY: interop broker
+.PHONY: interop outbox-check broker
 interop: gw-mqtt
 	@if [ -z "$(HAVE_MQTT)" ]; then \
 	  echo "SKIP: Paho C not found (install libpaho-mqtt-dev)"; exit 0; fi
 	@echo "--- starting gw-mqtt (18s) ---"
-	@./gw-mqtt --seconds 18 > .gw-mqtt.log 2>&1 & \
+	@MG_OUTBOX_FILE=.gw-mqtt.outbox ./gw-mqtt --seconds 18 > .gw-mqtt.log 2>&1 & \
 	 GW=$$!; sleep 2; \
-	 python3 tools/mqtt_interop.py; RC=$$?; \
+	 $(PYTHON) tools/mqtt_interop.py; RC=$$?; \
 	 kill $$GW 2>/dev/null; wait $$GW 2>/dev/null; \
 	 echo "--- gw-mqtt log ---"; tail -8 .gw-mqtt.log; \
 	 exit $$RC
 
+# QoS1 与断线补发：自己起停 mosquitto，不需要外部 broker
+outbox-check: gw-mqtt
+	@if [ -z "$(HAVE_MQTT)" ]; then \
+	  echo "SKIP: Paho C not found"; exit 0; fi
+	@$(PYTHON) tools/outbox_interop.py
+
 # 本地没有 mosquitto 时用独立实现的 broker（需要 pip install amqtt）
 broker:
-	@python3 tools/run_broker.py
+	@$(PYTHON) tools/run_broker.py
 
 test: $(TESTS)
 	@for t in $(TESTS); do echo "=== $$t ==="; ./$$t || exit 1; done
